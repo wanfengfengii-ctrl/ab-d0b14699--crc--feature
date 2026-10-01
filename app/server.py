@@ -91,6 +91,7 @@ class _Handler(BaseHTTPRequestHandler):
             result = reconstruct(
                 req.received, req.frame_count, req.sync,
                 req.payload_len, req.max_slippage,
+                chain_seed=req.chain_seed,
             )
         except Exception as exc:  # 防御：服务不因单个请求崩溃
             LOG.exception("reconstruction failed: %s", exc)
