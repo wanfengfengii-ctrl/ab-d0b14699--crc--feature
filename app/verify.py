@@ -61,6 +61,30 @@ def _req_url(url: str, payload=None, method="POST"):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _chain_fixture():
+    """构造确定性的跨帧链式 CRC 用例（非零种子 + 一插一漏）。
+
+    返回 (damaged, stream, frames, sync, plen, nf, seed)。该接收流在链式
+    规则下只需 2 次滑移精确复原；若按零初值逐帧独立求解，则会误判为
+    另一条"合法"串（零初值误报），可用于证明不能先找零初值候选再过滤。
+    """
+    from app.core import crc8
+    rng = random.Random(20261001)
+    sync = "10101011"
+    plen, nf, seed = 18, 3, 0xA5
+    frames, init = [], seed
+    for _ in range(nf):
+        body = sync + "".join(rng.choice("01") for _ in range(plen))
+        c = crc8(body, init)
+        frames.append(body + format(c, "08b"))
+        init = c
+    stream = "".join(frames)
+    # 固定脚本：漏失校正串第 12 位，再在（漏失后）第 10 位前插入 0
+    shifted = stream[:12] + stream[13:]
+    damaged = shifted[:10] + "0" + shifted[10:]
+    return damaged, stream, frames, sync, plen, nf, seed
+
+
 def smoke() -> bool:
     step("复原冒烟：调用 API（含伪同步字陷阱）")
     import time
@@ -188,7 +212,93 @@ def smoke() -> bool:
             ok = False
             print("  FAIL：已验证最小滑移下界应 >= 7")
 
-        # 5) 非法输入：逐字段错误
+        # 5) 跨帧链式 CRC：非零种子 + 一插一漏，逐帧返回初值与链路证据
+        (c_damaged, c_stream, c_frames, c_sync, c_plen, c_nf,
+         c_seed) = _chain_fixture()
+        status, body = post("/api/v1/recover", {
+            "received": c_damaged, "frame_count": c_nf, "sync": c_sync,
+            "payload_len": c_plen, "max_slippage": 6,
+            "chain_seed": format(c_seed, "08b"),
+        })
+        print(f"  POST 链式复原 -> {status}, "
+              f"slippage={body.get('slippage_count')}")
+        if status != 200 or not body.get("recoverable"):
+            ok = False
+            print("  FAIL：链式模式预算内应可复原")
+        else:
+            if body["slippage_count"] != 2:
+                ok = False
+                print("  FAIL：链式滑移次数应为 2")
+            if body.get("corrected") != c_stream:
+                ok = False
+                print("  FAIL：链式校正串与发送串不一致")
+            if body.get("chained_crc", {}).get("seed") != format(
+                    c_seed, "08b"):
+                ok = False
+                print("  FAIL：响应未回显链式种子")
+            for fi, f in enumerate(body["frames"]):
+                expect_init = c_seed if fi == 0 else int(
+                    body["frames"][fi - 1]["crc"], 2)
+                if int(f["crc_init"], 2) != expect_init:
+                    ok = False
+                    print(f"  FAIL：帧 {fi} 初值未沿前帧 CRC 传递")
+                ev = f.get("chain_evidence", {})
+                if not ev.get("crc_field_matches_register"):
+                    ok = False
+                    print(f"  FAIL：帧 {fi} CRC 字段与寄存器值不符")
+                if ev.get("residue_after_frame") != "00000000":
+                    ok = False
+                    print(f"  FAIL：帧 {fi} 整帧余数非 0")
+                if not frame_is_valid(f["raw"], c_sync, c_plen, expect_init):
+                    ok = False
+                    print(f"  FAIL：帧 {fi} 链式 CRC 校验不通过")
+
+        # 5b) 同一接收流不给种子（零初值逐帧）必须误判：这正是要防的情形
+        status0, body0 = post("/api/v1/recover", {
+            "received": c_damaged, "frame_count": c_nf, "sync": c_sync,
+            "payload_len": c_plen, "max_slippage": 6,
+        })
+        zero_misjudges = (
+            status0 == 200 and (
+                not body0.get("recoverable")
+                or body0.get("corrected") != c_stream))
+        print(f"  零初值逐帧对照 -> status={status0}, "
+              f"recoverable={body0.get('recoverable')}, "
+              f"是否误判={zero_misjudges}")
+        if not zero_misjudges:
+            ok = False
+            print("  FAIL：该用例应被零初值逐帧求解器误判（冒烟构造失效）")
+
+        # 5c) 非法链式种子：字段级错误，且不得泄露局部载荷
+        status, body = post("/api/v1/recover", {
+            "received": c_damaged, "frame_count": c_nf, "sync": c_sync,
+            "payload_len": c_plen, "max_slippage": 6,
+            "chain_seed": "1010010",
+        })
+        print(f"  POST 非法种子 -> {status}, fields="
+              f"{sorted(body.get('fields', {}))}")
+        if status != 422 or "chain_seed" not in body.get("fields", {}):
+            ok = False
+            print("  FAIL：非法 8 位种子应返回 chain_seed 字段错误")
+
+        # 5d) 链式超预算：只给不可复原结论与下界，不回退独立帧、不泄露载荷
+        status, body = post("/api/v1/recover", {
+            "received": c_stream + "1010101", "frame_count": c_nf,
+            "sync": c_sync, "payload_len": c_plen, "max_slippage": 6,
+            "chain_seed": format(c_seed, "08b"),
+        })
+        print(f"  POST 链式超预算 -> {status}, "
+              f"recoverable={body.get('recoverable')}, "
+              f"lower_bound={body.get('minimum_slippage_lower_bound')}")
+        if (body.get("recoverable") or "frames" in body
+                or "corrected" in body):
+            ok = False
+            print("  FAIL：链式超预算不得回退独立帧或泄露局部载荷")
+        if body.get("minimum_slippage_lower_bound", 0) < 7:
+            ok = False
+            print("  FAIL：链式已验证最小滑移下界应 >= 7")
+
+        # 6) 其余非法输入：逐字段错误
         status, body = post("/api/v1/recover", {
             "received": "02", "frame_count": 2, "sync": "10",
             "payload_len": 8, "max_slippage": 9,

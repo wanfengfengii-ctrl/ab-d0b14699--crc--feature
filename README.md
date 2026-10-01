@@ -23,6 +23,21 @@
   （标准 CRC-8/SMBus 移位实现，目录校验值 `"123456789" → 0xF4`）。
   合法整帧（含 CRC）经过同一移位寄存器后余数为 0。
 
+### 跨帧链式 CRC（选填）
+
+请求中选填 8 位 `chain_seed`（省略或为 `null` 时完全沿用上面的固定
+零初值模式，请求、响应与裁决保持兼容）。启用后：
+
+- **第一帧**以该种子初始化 CRC 寄存器；
+- **后续每帧**以前一帧**实际 CRC 字段**作为寄存器初值；
+- 每帧 CRC 仍按既有多项式，对「同步字+载荷」（从该帧初值出发）补八个
+  零取余并写入本帧 CRC 字段。
+
+链式约束**直接进入帧边界 DP 状态**：边界携带「下一帧寄存器初值」，帧内
+CRC 的 8 位由 body 末寄存器值强制确定、与其初值一同传播。服务在插入、
+漏失、载荷位与**跨帧种子传递**上联合复原，**不会**先按零初值独立成帧找
+候选再事后过滤。
+
 信道模型只允许两类差错，各计 **1 次滑移**：
 
 - `insertion`：接收流多出一个噪声比特（发送侧不消耗位）；
@@ -60,7 +75,8 @@
   "frame_count": 3,
   "sync": "10101011",
   "payload_len": 18,
-  "max_slippage": 6
+  "max_slippage": 6,
+  "chain_seed": "10100101"
 }
 ```
 
@@ -71,6 +87,7 @@
 | `sync` | string | 6..12 位 `0`/`1` |
 | `payload_len` | int | 16..48 |
 | `max_slippage` | int | 0..6 |
+| `chain_seed` | string/int | 选填：恰好 8 位 `0/1` 串，或 0..255 整数；省略/`null` 为零初值原模式 |
 
 成功（HTTP 200，`recoverable=true`）：
 
@@ -97,6 +114,35 @@
 
 - `events[].position` 基于校正串（发送侧）0 计位；插入位在该位置之前
   （0 = 流首，串长 = 流尾），漏失位即该位置。
+
+启用 `chain_seed` 时，成功响应额外携带 `chained_crc`，并在每帧给出使用
+的初值与链路校验证据：
+
+```json
+{
+  "chained_crc": {"enabled": true, "seed": "10100101", "seed_hex": "A5",
+                  "rule": "第一帧…以后每帧以前一帧实际 CRC 为初值…"},
+  "frames": [
+    {"index": 0, "payload": "…", "crc": "…", "raw": "…",
+     "crc_init": "10100101", "crc_init_hex": "A5",
+     "init_source": "seed",
+     "chain_evidence": {
+       "register_after_body": "…（body 移入后的寄存器值，即写入的 CRC）",
+       "crc_field_matches_register": true,
+       "residue_after_frame": "00000000"}},
+    {"index": 1, "crc_init": "<帧 0 的 crc>", "crc_init_hex": "…",
+     "init_source": "previous_crc", "chain_evidence": { … }}
+  ]
+}
+```
+
+- 帧 0 `crc_init` 为种子（`init_source="seed"`）；其后每帧 `crc_init`
+  恰为前一帧的 `crc`（`init_source="previous_crc"`）。
+- `register_after_body` 是 body（同步字+载荷）从该初值移入后的寄存器
+  值，应与本帧 `crc` 相等；`residue_after_frame` 恒为 `00000000`。
+- 链式模式下仍按滑移次数最小、同代价校正串字典序最小裁决，并报告
+  `unique` / `alternatives`。预算内无解时只返回不可复原结论与已验证的
+  最小滑移下界，**不回退为独立帧、不泄露局部载荷**。
 - 不可复原（HTTP 200，`recoverable=false`）：
 
 ```json
@@ -138,8 +184,11 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 `verify` 汇总三项，全过退出码为 0：
 
 - `build`：全部源文件字节码编译检查；
-- `tests`：`tests/` 全套单元 / 对拍 / HTTP 测试；
-- `smoke`：健康检查、含**伪同步字陷阱**的复原、超预算下界、非法字段错误。
+- `tests`：`tests/` 全套单元 / 对拍 / HTTP 测试（含链式朴素穷举对拍）；
+- `smoke`：健康检查、含**伪同步字陷阱**的复原、超预算下界、非法字段
+  错误，以及**跨帧链式 CRC** 冒烟——含一个会被逐帧零初值求解器误判、
+  但链式规则 2 次滑移即可精确复原的固定用例（并验证逐帧初值/证据、
+  非法种子字段错误、链式超预算不回退不泄露）。
 
 ## 本地开发（无需 Docker）
 
@@ -152,10 +201,10 @@ TELEMETRY_PORT=8080 python3 -m app.server  # 启动 API
 目录：
 
 ```
-app/core.py        # CRC-8、联合复原 DP、事件定位
-app/validation.py  # 入参校验（逐字段错误）
+app/core.py        # CRC-8、链式初值、联合复原 DP、事件定位
+app/validation.py  # 入参校验（逐字段错误，含 chain_seed）
 app/server.py      # 标准库 HTTP API + 健康检查
 app/verify.py      # 一次性自检（构建/测试/冒烟 + 退出码）
-tests/             # CRC、求解器对拍、校验、HTTP 端到端测试
+tests/             # CRC、求解器对拍、链式对拍、校验、HTTP 端到端测试
 Dockerfile, docker-compose.yml
 ```

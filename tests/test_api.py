@@ -155,6 +155,70 @@ class ApiTests(unittest.TestCase):
                     break
         self.assertTrue(naive_bad, "伪同步字应使朴素定长截取产生非法帧")
 
+    def test_chained_crc_recovery_via_api(self):
+        """链式种子经 API 生效：逐帧初值沿前帧 CRC 传递并回传证据。"""
+        from app.verify import _chain_fixture
+        damaged, stream, frames, sync, plen, nf, seed = _chain_fixture()
+        status, body = self._request("/api/v1/recover", {
+            "received": damaged, "frame_count": nf, "sync": sync,
+            "payload_len": plen, "max_slippage": 6,
+            "chain_seed": format(seed, "08b"),
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"], body)
+        self.assertEqual(body["slippage_count"], 2)
+        self.assertEqual(body["corrected"], stream)
+        self.assertEqual(body["chained_crc"]["seed"], format(seed, "08b"))
+        for i, f in enumerate(body["frames"]):
+            expect_init = seed if i == 0 else int(
+                body["frames"][i - 1]["crc"], 2)
+            self.assertEqual(int(f["crc_init"], 2), expect_init)
+            self.assertEqual(f["init_source"],
+                             "seed" if i == 0 else "previous_crc")
+            self.assertTrue(
+                f["chain_evidence"]["crc_field_matches_register"])
+            self.assertEqual(
+                f["chain_evidence"]["residue_after_frame"], "00000000")
+
+        # 同一接收流不带种子：零初值逐帧必须误判（不给原发送串）
+        status0, body0 = self._request("/api/v1/recover", {
+            "received": damaged, "frame_count": nf, "sync": sync,
+            "payload_len": plen, "max_slippage": 6,
+        })
+        self.assertEqual(status0, 200)
+        self.assertTrue(not body0.get("recoverable")
+                        or body0.get("corrected") != stream)
+        self.assertNotIn("chained_crc", body0)
+        for f in body0.get("frames", []):
+            self.assertNotIn("crc_init", f)
+
+    def test_chained_seed_int_and_illegal_field(self):
+        rng = random.Random(71)
+        sync = "10101011"
+        payloads = ["".join(rng.choice("01") for _ in range(18))
+                    for _ in range(3)]
+        stream_frames, init = [], 0x3C
+        for p in payloads:
+            body = sync + p
+            init = crc8(body, init)
+            stream_frames.append(body + format(init, "08b"))
+        stream = "".join(stream_frames)
+        # 整数种子
+        status, body = self._request("/api/v1/recover", {
+            "received": stream, "frame_count": 3, "sync": sync,
+            "payload_len": 18, "max_slippage": 6, "chain_seed": 0x3C,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"])
+        self.assertEqual(body["chained_crc"]["seed_hex"], "3C")
+        # 非法种子 -> 422 字段错误
+        status, body = self._request("/api/v1/recover", {
+            "received": stream, "frame_count": 3, "sync": sync,
+            "payload_len": 18, "max_slippage": 6, "chain_seed": "12",
+        })
+        self.assertEqual(status, 422)
+        self.assertIn("chain_seed", body["fields"])
+
     def test_unrecoverable_returns_lower_bound_no_partials(self):
         rng = random.Random(8)
         sync = "11001100"

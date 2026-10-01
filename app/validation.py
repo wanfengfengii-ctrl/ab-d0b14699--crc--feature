@@ -30,6 +30,7 @@ class RecoverRequest:
     sync: str
     payload_len: int
     max_slippage: int
+    chain_seed: int | None = None  # 选填：8 位跨帧链式 CRC 初始种子
 
 
 def _is_int(value) -> bool:
@@ -100,7 +101,27 @@ def validate(data: object) -> RecoverRequest:
     elif not (0 <= ms <= SLIPPAGE_MAX_LIMIT):
         errors["max_slippage"] = f"必须在 0..{SLIPPAGE_MAX_LIMIT} 之间"
 
+    # chain_seed（选填：省略或 null 表示沿用固定零初值的原模式）
+    chain_seed = None
+    if "chain_seed" in data and data["chain_seed"] is not None:
+        seed = data["chain_seed"]
+        if _is_int(seed):
+            if not (0 <= seed <= 0xFF):
+                errors["chain_seed"] = "整数种子必须在 0..255（8 位）之间"
+            else:
+                chain_seed = seed
+        elif isinstance(seed, str):
+            if len(seed) != 8 or not all(c in "01" for c in seed):
+                errors["chain_seed"] = (
+                    "必须是恰好 8 位的 0/1 字符串"
+                    "（或 0..255 的整数）")
+            else:
+                chain_seed = int(seed, 2)
+        else:
+            errors["chain_seed"] = (
+                "必须是 8 位 0/1 字符串或 0..255 的整数")
+
     if errors:
         raise ValidationError(errors)
 
-    return RecoverRequest(received, fc, sync, pl, ms)
+    return RecoverRequest(received, fc, sync, pl, ms, chain_seed)
